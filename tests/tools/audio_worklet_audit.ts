@@ -12,13 +12,14 @@
  * re-priming one packet deeper once a late packet ends it, the server's quiet
  * mark playing a sound shorter than the priming depth at once and making the
  * silence after it no underrun (also when the mark trails the queue running
- * dry), the standing-depth trim, the clean-stretch decay, the ceiling that
- * cuts a backlog to the target at once, and the depths sized from the frame
+ * dry), the standing-depth trim, the clean-stretch decay, the backlog that
+ * plays on at the ceiling while it grows and is cut to the target in one seam
+ * once it stops or holds a second, and the depths sized from the frame
  * duration are pinned without a browser, and so is the smoothing of every
- * seam: a continuous tone stays continuous through a trim, a cut at the
- * ceiling, running dry, and the re-prime after it. The frame the server sends behind the mark, carrying the end of
- * the sound and marked quiet too, is appended to that sound and never taken
- * for new sound or a late one.
+ * seam: a continuous tone stays continuous through a trim, a backlog's cut,
+ * running dry, and the re-prime after it. The frame the server sends behind
+ * the mark, carrying the end of the sound and marked quiet too, is appended
+ * to that sound and never taken for new sound or a late one.
  *
  * Prints one PASS/FAIL line per check and exits non-zero if any failed.
  * @module
@@ -59,7 +60,10 @@ interface Processor {
   senderQuiet: boolean;
   audioBufferQueue: Float32Array[];
   droppedOldest: number;
+  seams: number;
   MAX_BUFFER_PACKETS: number;
+  BACKLOG_MAX_PACKETS: number;
+  BACKLOG_CALM_QUANTA: number;
   TARGET_MIN: number;
   TARGET_MAX: number;
   STEP: number;
@@ -159,43 +163,64 @@ out.endingFrameEndsPendingAsSilence = (!p.underrunPending && p.senderQuiet && p.
 // over proven slack, under arrival exactly rate-matched to consumption
 // (4 packets per 15 calls = 128 samples per call) -- with no audible
 // probe: reclaiming latency must not itself conceal.
-for (let v = 1; v <= 8; v++) feed(v / 10);
+while (p.audioBufferQueue.length < p.MAX_BUFFER_PACKETS - 1) feed(0.9);
 const before = p.audioBufferQueue.length;
+const seamsBefore = p.seams;
+const droppedBefore = p.droppedOldest;
 const underBefore = p.underrunSamples;
 for (let i = 0; i < 4600; i++) {
   run();
   if (i % 15 === 3 || i % 15 === 7 || i % 15 === 11 || i % 15 === 14) feed(0.9);
 }
 out.trimmed = (p.audioBufferQueue.length <= p.target + 1);
-const trimStats = `before=${before} after=${p.audioBufferQueue.length} ` +
+out.trimmedAPacketASeam = (p.seams - seamsBefore === p.droppedOldest - droppedBefore && p.seams > seamsBefore);
+const trimStats = `before=${before} after=${p.audioBufferQueue.length} seams=${p.seams - seamsBefore} ` +
   `target=${p.target} underruns=${p.underrunSamples - underBefore}`;
 out.decayedOverProvenSlack = (p.target <= 3);
 out.reclaimWasSilentFree = (p.underrunSamples === underBefore);
 
-// A packet arriving at the ceiling cuts the queue to the target in one seam.
-while (p.audioBufferQueue.length < p.MAX_BUFFER_PACKETS) feed(0.9);
-const cutBefore = p.droppedOldest;
-feed(0.9);
-out.ceilingCutsToTarget = (p.audioBufferQueue.length === p.target);
-out.droppedCounted = (p.droppedOldest - cutBefore === p.MAX_BUFFER_PACKETS - p.target + 1);
+// A queue at its ceiling is a backlog: it plays on whole while it grows, and
+// once it has not grown for 100 ms it is cut to the target in one seam.
+{
+  const rateMatched = (calls: number): void => {
+    for (let i = 0; i < calls; i++) {
+      run();
+      if (i % 15 === 3 || i % 15 === 7 || i % 15 === 11 || i % 15 === 14) feed(0.9);
+    }
+  };
+  while (p.audioBufferQueue.length < p.MAX_BUFFER_PACKETS + 20) feed(0.9);
+  const cutBefore = p.droppedOldest;
+  const cutSeams = p.seams;
+  out.backlogHeldWhileGrowing = (p.droppedOldest === cutBefore);
+  rateMatched(15);
+  out.backlogPlaysOn = (p.droppedOldest === cutBefore && p.audioBufferQueue.length >= p.MAX_BUFFER_PACKETS + 19);
+  rateMatched(p.BACKLOG_CALM_QUANTA + 15);
+  out.backlogCutToTarget = (Math.abs(p.audioBufferQueue.length - p.target) <= 1);
+  out.backlogCutInOneSeam = (p.seams - cutSeams === 1 && p.droppedOldest - cutBefore >= 20);
+}
 
 // A backlog reaching the page three times faster than it plays (three seconds
-// of it, four packets every five quanta) is skipped through in cuts, each to
-// the target, not shed a packet per arrival: far fewer seams than packets shed.
+// of it, four packets every five quanta) plays on late and is cut when it
+// holds a second and once more when it ends: a few seams, not one for each
+// packet shed or each time the queue fills.
 let backlogStats: string;
 {
   const q = new Cls({ processorOptions: { channels: 1 } });
   const quantum = (): void => { q.process([], [[new Float32Array(128)]], {}); };
-  let seams = 0;
+  let deepest = 0;
   for (let i = 0; i < 375; i++) {
     quantum();
     if (i % 5 === 4) continue;
-    const before = q.droppedOldest;
     q.enqueue(new Float32Array(PKT).fill(0.5).buffer);
-    if (q.droppedOldest > before) seams++;
+    deepest = Math.max(deepest, q.audioBufferQueue.length);
   }
-  out.backlogCutNotShed = q.droppedOldest >= 150 && seams * 4 <= q.droppedOldest;
-  backlogStats = `shed=${q.droppedOldest} seams=${seams}`;
+  for (let i = 0; i < 60; i++) {
+    quantum();
+    if (i % 15 === 3 || i % 15 === 7 || i % 15 === 11 || i % 15 === 14) q.enqueue(new Float32Array(PKT).fill(0.5).buffer);
+  }
+  out.backlogBounded = deepest <= q.BACKLOG_MAX_PACKETS;
+  out.backlogCutNotShed = q.droppedOldest >= 150 && q.seams <= 3 && q.audioBufferQueue.length <= q.target + 1;
+  backlogStats = `shed=${q.droppedOldest} seams=${q.seams} deepest=${deepest}`;
 }
 
 // The direct port line feeds the same queue and carries the quiet mark.
@@ -225,7 +250,7 @@ out.sized60ms = sized(2880) === '2,2,1,3';
 // Seams on tonal content: a 1037 Hz tone (10 ms is not a whole number of its
 // periods, so every dropped packet shifts its phase) must step from sample to
 // sample no more than about its own slope, 0.068 at half scale, through a
-// trim, a cut at the ceiling, running dry, and the fade back in.
+// backlog's cut, a trim, running dry, and the fade back in.
 let seamStats: string;
 {
   const q = new Cls({ processorOptions: { channels: 1 } });
@@ -241,14 +266,18 @@ let seamStats: string;
     q.process([], [[buf]], {});
     for (const x of buf) { maxStep = Math.max(maxStep, Math.abs(x - prev)); prev = x; }
   };
+  const matched = (calls: number): void => {
+    for (let i = 0; i < calls; i++) {
+      step();
+      if (i % 15 === 3 || i % 15 === 7 || i % 15 === 11 || i % 15 === 14) q.enqueue(tone());
+    }
+  };
   for (let i = 0; i < 12; i++) q.enqueue(tone());
-  out.seamsCutAtCeiling = q.droppedOldest > 0;
-  const droppedBefore = q.droppedOldest;
-  for (let i = 0; i < 1200; i++) {
-    step();
-    if (i % 15 === 3 || i % 15 === 7 || i % 15 === 11 || i % 15 === 14) q.enqueue(tone());
-  }
-  out.seamsTrimmed = q.droppedOldest - droppedBefore >= 1;
+  matched(60);
+  out.seamsCutBacklog = q.seams === 1 && q.droppedOldest >= 5;
+  for (let i = 0; i < 3; i++) q.enqueue(tone());
+  matched(1200);
+  out.seamsTrimmed = q.seams >= 2;
   for (let i = 0; i < 60; i++) step();
   out.seamsRanDry = q.priming;
   for (let i = 0; i < 3; i++) q.enqueue(tone());

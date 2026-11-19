@@ -106,6 +106,7 @@ declare global {
     currentAudioDropped: number;
     currentAudioUnderrunSamples: number;
     currentAudioWorkletDropped: number;
+    currentAudioWorkletSeams: number;
     currentAudioLevel: number;
     /** Present in Chromium, with the members its own pages and extensions get. */
     chrome?: { webstore?: object; runtime?: object };

@@ -87,6 +87,7 @@
  * `currentAudioBufferSize`,
  * `currentAudioBufferDuration`, `currentAudioLevel`,
  * `currentAudioUnderrunSamples`, `currentAudioWorkletDropped`,
+ * `currentAudioWorkletSeams`,
  * `currentAudioDropped`, `manual_resolution`, `enable_resize`,
  * `streamResolutionDiverged`, `isAudioInitializing`, `isFallingBack`,
  * `isCleaningUp`, `applyTimestamp`, and `selkiesTransport` (the page-side
@@ -419,6 +420,7 @@ window.currentAudioBufferSize = 0;
  */
 window.currentAudioUnderrunSamples = 0;
 window.currentAudioWorkletDropped = 0;
+window.currentAudioWorkletSeams = 0;
 window.currentAudioDropped = 0;
 /**
  * Track-generator sink: decoded VideoFrames are presented through a `<video>`
@@ -659,10 +661,10 @@ const SHARED_STALL_MAX_BACKOFF_MS = 30000;
 const METRICS_INTERVAL_MS = 500;
 /**
  * Worklet depth past which the page's own audio relay drops packets: the
- * playback worklet's drop-oldest ceiling, so the relay never holds the queue
- * under a target the worklet deepens to.
+ * depth the playback worklet holds a backlog to before it cuts to the newest
+ * sound, so the relay drops none of what that cut would keep.
  */
-const AUDIO_RELAY_CEILING_MS = 80;
+const AUDIO_RELAY_CEILING_MS = 1000;
 /**
  * The URL an AudioWorklet loads `code` from. A data: URL: WebKit's worklet
  * thread asks the main thread for a Blob URL's origin and waits, while its
@@ -7327,23 +7329,30 @@ class WorkerWebSocket {
                 this.currentAudioData = null;
                 this.currentDataOffset = 0;
 
-                // Adaptive jitter depth under a fixed ceiling that cuts to live.
-                // Output starts once target packets are queued; a mid-stream
-                // underrun that a late delivery caused deepens the target, a
-                // clean stretch decays it back, and standing depth above it is
-                // trimmed a packet at a time -- so steady latency sits at the
-                // smallest depth the delivery path has recently proven to
-                // hold, and a jittery one (a stall upstream, Gecko routing
-                // the socket through the page's thread) buys the depth it
-                // demonstrably needs. The depths are durations counted in
-                // packets of the frame duration the stream carries (see
-                // _learnFrame), so they mean the same at every setting.
+                // Adaptive jitter depth under a fixed ceiling. Output starts
+                // once target packets are queued; a mid-stream underrun that a
+                // late delivery caused deepens the target, a clean stretch
+                // decays it back, and standing depth above it is trimmed a
+                // packet at a time -- so steady latency sits at the smallest
+                // depth the delivery path has recently proven to hold, and a
+                // jittery one (a stall upstream, Gecko routing the socket
+                // through the page's thread) buys the depth it demonstrably
+                // needs. A queue at its ceiling is a backlog reaching the
+                // page late (see _cutBacklog): it plays on while it grows and
+                // is cut to the target in one seam once it stops. The depths
+                // are durations counted in packets of the frame duration the
+                // stream carries (see _learnFrame), so they mean the same at
+                // every setting.
                 this.frameSamples = 0;
                 this._learnFrame(480);
                 this.target = this.TARGET_MIN;
                 this.priming = true;
                 this.overCount = 0;
                 this.cleanCount = 0;
+                // The deepest a held backlog has been, and the quanta since
+                // it last grew.
+                this.backlogPeak = 0;
+                this.backlogCalm = 0;
                 // Packets left at the moment one is pulled, tracked at its
                 // minimum: the slack that proves a shallower target safe.
                 // Pulls since the last arrival are held apart and committed
@@ -7366,10 +7375,13 @@ class WorkerWebSocket {
                 this.underrunPending = false;
                 this.pendingUnderrunSamples = 0;
 
-                // Concealment counters: zero-filled samples output on underrun, and
-                // packets dropped from the head of the queue, by the trim or at its ceiling.
+                // Concealment counters: zero-filled samples output on underrun,
+                // packets dropped from the head of the queue, by the trim or
+                // with a backlog, and the seams those drops left in the sound
+                // (one for a trimmed packet, one for a whole backlog).
                 this.underrunSamples = 0;
                 this.droppedOldest = 0;
+                this.seams = 0;
                 // Every seam is smoothed over 2 ms: output fades in when priming
                 // ends, the last sample decays to silence when the queue runs
                 // dry, and a dropped packet's head is blended into the head of
@@ -7404,8 +7416,8 @@ class WorkerWebSocket {
                         else if (this.drainSlackMin < this.shiftSlackMin) this.shiftSlackMin = this.drainSlackMin;
                     }
                     this.drainSlackMin = Infinity;
-                    if (this.audioBufferQueue.length >= this.MAX_BUFFER_PACKETS) this._spliceToLive();
                     this.audioBufferQueue.push(pcmData);
+                    if (this.audioBufferQueue.length > this.BACKLOG_MAX_PACKETS) this._cutBacklog();
                 };
                 const receive = (data) => {
                     if (!data) return;
@@ -7435,6 +7447,7 @@ class WorkerWebSocket {
                             durationMs: bufferMillis,
                             underrunSamples: this.underrunSamples,
                             droppedOldest: this.droppedOldest,
+                            seams: this.seams,
                             level: level
                         });
                     }
@@ -7508,15 +7521,27 @@ class WorkerWebSocket {
                     this.currentDataOffset = 0;
                 }
 
-                // Reclaims latency: depth held above target is a standing
-                // delay, dropped one packet per window; long clean runs
-                // shrink the target.
-                if (this.audioBufferQueue.length > this.target) {
+                // Reclaims latency: a backlog is cut once it has stopped
+                // growing, depth held above target under the ceiling is a
+                // standing delay, dropped one packet per window, and long
+                // clean runs shrink the target.
+                const depth = this.audioBufferQueue.length;
+                if (depth >= this.MAX_BUFFER_PACKETS) {
+                    this.overCount = 0;
+                    if (depth > this.backlogPeak) {
+                        this.backlogPeak = depth;
+                        this.backlogCalm = 0;
+                    } else if (++this.backlogCalm >= this.BACKLOG_CALM_QUANTA) {
+                        this._cutBacklog();
+                    }
+                } else if (depth > this.target) {
+                    this.backlogPeak = 0;
                     if (++this.overCount >= 250) {
                         this._dropHead();
                         this.overCount = 0;
                     }
                 } else {
+                    this.backlogPeak = 0;
                     this.overCount = 0;
                 }
                 if (++this.cleanCount >= 2000) {
@@ -7557,6 +7582,7 @@ class WorkerWebSocket {
             _dropHead() {
                 const gone = this.audioBufferQueue.shift();
                 this.droppedOldest++;
+                this.seams++;
                 this._blendHead(gone);
             }
 
@@ -7580,21 +7606,29 @@ class WorkerWebSocket {
             }
 
             /**
-             * Cuts a queue that reached its ceiling down to the target in
-             * one seam, the packet arriving being its newest: packets
-             * arriving faster than they play are a backlog reaching the page
-             * late, and dropping one of them for each that arrives would
-             * play that whole backlog sped up, where one cut skips to the
-             * live sound.
+             * Cuts a backlog down to the target in one seam, keeping its
+             * newest packets. Packets arriving faster than they play are a
+             * backlog reaching the page late, after a congested stretch:
+             * dropping one for each that arrives would play all of it sped
+             * up, and cutting it whenever the queue fills would chop it for
+             * as long as it keeps arriving. So a queue at its ceiling plays
+             * on, late but whole, while it grows, and is cut here once it
+             * has not grown for 100 ms, which is when the arrivals are live
+             * again, or once it holds a second of sound.
              */
-            _spliceToLive() {
-                const keep = Math.max(this.target - 1, 0);
-                const excess = this.audioBufferQueue.length - keep;
+            _cutBacklog() {
+                const excess = this.audioBufferQueue.length - this.target;
+                this.backlogPeak = 0;
+                this.backlogCalm = 0;
                 if (excess <= 0) return;
                 const gone = this.audioBufferQueue[0];
                 this.audioBufferQueue.splice(0, excess);
                 this.droppedOldest += excess;
+                this.seams++;
                 this.overCount = 0;
+                // What the backlog left spare proves no shallower target safe.
+                this.shiftSlackMin = Infinity;
+                this.drainSlackMin = Infinity;
                 this._blendHead(gone);
             }
 
@@ -7618,9 +7652,10 @@ class WorkerWebSocket {
              * queued, which leaves N - 1 packets of arrival slack behind the
              * one playing, so the durations are slack: the target keeps its
              * floor of two packets, deepens and decays in steps of 5 ms, and
-             * stops once 50 ms of slack is reached, with the drop-oldest
-             * ceiling 20 ms above that, each rounded up to whole packets --
-             * two, six, one, and eight at the default 10 ms frame.
+             * stops once 50 ms of slack is reached, with the ceiling 20 ms
+             * above that, each rounded up to whole packets -- two, six, one,
+             * and eight at the default 10 ms frame. A backlog is held up to
+             * a second deep and cut once it has not grown for 100 ms.
              * @param {number} frames Samples per channel in one packet.
              */
             _learnFrame(frames) {
@@ -7632,6 +7667,8 @@ class WorkerWebSocket {
                 this.TARGET_MAX = 1 + packets(50);
                 this.STEP = packets(5);
                 this.MAX_BUFFER_PACKETS = this.TARGET_MAX + packets(20);
+                this.BACKLOG_MAX_PACKETS = Math.max(packets(1000), this.MAX_BUFFER_PACKETS);
+                this.BACKLOG_CALM_QUANTA = Math.ceil(sampleRate * 0.1 / 128);
                 if (this.target !== undefined) {
                     this.target = Math.min(Math.max(this.target, this.TARGET_MIN), this.TARGET_MAX);
                 }
@@ -7656,7 +7693,7 @@ class WorkerWebSocket {
       });
       audioWorkletProcessorPort = audioWorkletNode.port;
       wireDecoderToWorklet();
-      audioWorkletProcessorPort.onmessage = (event: MessageEvent<{ type: string; size: number; durationMs: number; underrunSamples?: number; droppedOldest?: number; level?: number }>): void => {
+      audioWorkletProcessorPort.onmessage = (event: MessageEvent<{ type: string; size: number; durationMs: number; underrunSamples?: number; droppedOldest?: number; seams?: number; level?: number }>): void => {
         if (event.data.type === 'audioBufferSize') {
             window.currentAudioBufferSize = event.data.size;
             window.currentAudioBufferDuration = event.data.durationMs;
@@ -7665,6 +7702,9 @@ class WorkerWebSocket {
             }
             if (event.data.droppedOldest !== undefined) {
               window.currentAudioWorkletDropped = event.data.droppedOldest;
+            }
+            if (event.data.seams !== undefined) {
+              window.currentAudioWorkletSeams = event.data.seams;
             }
             if (event.data.level !== undefined) {
               // Output RMS as a 0 to 100 level for the dashboards' audio meter.
