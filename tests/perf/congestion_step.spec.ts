@@ -14,10 +14,14 @@
 // `websockets`: through a metered TCP relay (bwrelay, its rate stepped on its
 // stdin), with the socket on the page, where every message it delivers is
 // timed (its type byte and size), and the player's queue depth, the packets
-// it dropped from its head and the silence it filled in. Read: how audio
-// arrived (its rate, its longest gap, its densest 100 ms), what the player
-// dropped and how deep it ran, and the gaps in audio that end with a large
-// video message ahead of it (audio held behind video on the socket).
+// it dropped from its head, the seams those drops left in the sound and the
+// silence it filled in. Read: how audio arrived (its rate, its longest gap,
+// its densest 100 ms), what the player dropped, in how many seams, and how
+// deep it ran, and the gaps in audio that end with a large video message
+// ahead of it (audio held behind video on the socket). The tone played is a
+// time code (its pitch names the 100 ms slot of a 10 s cycle it was made in),
+// which an analyser on the player's output reads back every 10 ms: how late
+// the sound heard is, and for how long nothing was heard.
 //
 // `webrtc` and `webrtc-split`: Chromium behind UDP relays whose downlink rate
 // steps, read from getStats: the audio the jitter buffer sped up (removed for
@@ -132,7 +136,24 @@ const TAP_JS = `(() => {
     window.AudioWorkletNode = class extends OrigNode {
       constructor(...args) {
         super(...args);
-        if (args[1] === 'audio-frame-processor') window.__playerPort = this.port;
+        if (args[1] !== 'audio-frame-processor') return;
+        window.__playerPort = this.port;
+        // What the player puts out, read every 10 ms: the loudest pitch and its level.
+        const ctx = this.context;
+        const an = ctx.createAnalyser();
+        an.fftSize = 2048;
+        an.smoothingTimeConstant = 0;
+        this.connect(an);
+        const bins = new Float32Array(an.frequencyBinCount);
+        const hz = ctx.sampleRate / an.fftSize;
+        const heard = [];
+        window.__heard = heard;
+        setInterval(() => {
+          an.getFloatFrequencyData(bins);
+          let a = 0;
+          for (let i = 1; i < bins.length; i++) if (bins[i] > bins[a]) a = i;
+          heard.push([performance.now(), Date.now(), Math.round(a * hz), Math.round(bins[a])]);
+        }, 10);
       }
     };
   }
@@ -141,12 +162,14 @@ const TAP_JS = `(() => {
   setInterval(() => {
     window.__playerPort?.postMessage({ type: 'getBufferSize' });
     samples.push([performance.now(), window.currentAudioBufferDuration ?? null, window.currentAudioWorkletDropped ?? null,
-                  window.currentAudioUnderrunSamples ?? null]);
+                  window.currentAudioUnderrunSamples ?? null, window.currentAudioWorkletSeams ?? null]);
   }, 100);
 })();`;
 
 type Arrival = [number, number, number];
-type Sample = [number, number | null, number | null, number | null];
+type Sample = [number, number | null, number | null, number | null, number | null];
+/** [page clock, wall clock, loudest pitch in Hz, its level in dB] */
+type Heard = [number, number, number, number];
 
 const num = (v: unknown): number | null => (typeof v === 'number' ? v : null);
 
@@ -157,7 +180,74 @@ function asArrivals(v: unknown): Arrival[] {
 
 /** The page's samples, as numbers or nulls. */
 function asSamples(v: unknown): Sample[] {
-    return Array.isArray(v) ? v.flatMap((a): Sample[] => (Array.isArray(a) ? [[num(a[0]) ?? 0, num(a[1]), num(a[2]), num(a[3])]] : [])) : [];
+    return Array.isArray(v) ? v.flatMap((a): Sample[] => (Array.isArray(a) ? [[num(a[0]) ?? 0, num(a[1]), num(a[2]), num(a[3]), num(a[4])]] : [])) : [];
+}
+
+/** The page's readings of the player's output, as numbers. */
+function asHeard(v: unknown): Heard[] {
+    return Array.isArray(v) ? v.flatMap((a): Heard[] => (Array.isArray(a) ? [[num(a[0]) ?? 0, num(a[1]) ?? 0, num(a[2]) ?? 0, num(a[3]) ?? -Infinity]] : [])) : [];
+}
+
+/** The time code's cycle, its slots, and the pitch of the first with the step between them. */
+const TC_CYCLE_MS = 10_000;
+const TC_SLOT_MS = 100;
+const TC_BASE_HZ = 400;
+const TC_STEP_HZ = 100;
+/** A reading under this level is silence. */
+const TC_SILENT_DB = -70;
+
+/**
+ * Plays the time code into the sound server: a tone whose pitch names the
+ * slot of the cycle the wall clock is in.
+ */
+function timeCode(): ChildProcess {
+    const rate = 48_000;
+    const cat = spawn('pacat', ['--playback', '-d', 'output', '--format=s16le', `--rate=${rate}`, '--channels=1', '--latency-msec=20', '--raw'], { stdio: ['pipe', 'ignore', 'ignore'] });
+    const start = Date.now();
+    let written = 0;
+    let angle = 0;
+    const timer = setInterval(() => {
+        const due = Math.round(((Date.now() - start + 40) * rate) / 1000);
+        if (due <= written) return;
+        const buf = Buffer.alloc((due - written) * 2);
+        for (let i = 0; i < due - written; i += 1) {
+            const at = start + ((written + i) * 1000) / rate;
+            angle += (2 * Math.PI * (TC_BASE_HZ + TC_STEP_HZ * Math.floor((at % TC_CYCLE_MS) / TC_SLOT_MS))) / rate;
+            buf.writeInt16LE(Math.round(Math.sin(angle) * 12_000), i * 2);
+        }
+        written = due;
+        cat.stdin.write(buf);
+    }, 10);
+    cat.on('exit', () => { clearInterval(timer); });
+    cat.stdin.on('error', () => { clearInterval(timer); });
+    return cat;
+}
+
+/** How long ago the pitch read at wall-clock `at` was made, in ms within the cycle, or null for no time code. */
+function lateness(at: number, hz: number): number | null {
+    const slot = Math.round((hz - TC_BASE_HZ) / TC_STEP_HZ);
+    if (slot < 0 || slot >= TC_CYCLE_MS / TC_SLOT_MS || Math.abs(hz - (TC_BASE_HZ + TC_STEP_HZ * slot)) > 30) return null;
+    return ((((at % TC_CYCLE_MS) - (slot * TC_SLOT_MS + TC_SLOT_MS / 2)) % TC_CYCLE_MS) + TC_CYCLE_MS) % TC_CYCLE_MS;
+}
+
+interface HeardPhase {
+    /** The median lateness of the sound heard, in ms, the capture's own delay included. */
+    lateP50Ms: number | null;
+    lateMaxMs: number | null;
+    /** How long nothing was heard, in ms. */
+    silentMs: number;
+}
+
+/** What was heard from `from` to `to` on the page's clock. */
+function heardPhase(heard: readonly Heard[], from: number, to: number): HeardPhase {
+    const inside = heard.filter(([t]) => t >= from && t < to);
+    const late = inside.flatMap(([, wall, hz, db]) => { const l = db > TC_SILENT_DB ? lateness(wall, hz) : null; return l === null ? [] : [l]; }).sort((a, b) => a - b);
+    const span = inside.length > 1 ? (inside[inside.length - 1][0] - inside[0][0]) / (inside.length - 1) : 10;
+    return {
+        lateP50Ms: late.length ? Math.round(late[Math.floor(late.length / 2)]) : null,
+        lateMaxMs: late.length ? Math.round(late[late.length - 1]) : null,
+        silentMs: Math.round(inside.filter(([, , , db]) => db <= TC_SILENT_DB).length * span),
+    };
 }
 
 interface Phase {
@@ -166,6 +256,7 @@ interface Phase {
     longestGapMs: number;
     densest100ms: number;
     dropped: number;
+    seams: number;
     deepestMs: number;
     underrunMs: number;
     gapsBehindVideo: number;
@@ -190,13 +281,14 @@ function phase(arrivals: readonly Arrival[], samples: readonly Sample[], from: n
     const inside = samples.filter(([t]) => t >= from && t < to);
     const first = inside[0];
     const last = inside.at(-1);
-    const delta = (k: 2 | 3): number => (first && last ? (last[k] ?? 0) - (first[k] ?? 0) : 0);
+    const delta = (k: 2 | 3 | 4): number => (first && last ? (last[k] ?? 0) - (first[k] ?? 0) : 0);
     return {
         audio: audio.length,
         audioPerS: Math.round((audio.length * 1000) / Math.max(1, to - from)),
         longestGapMs: Math.round(longest),
         densest100ms: densest,
         dropped: delta(2),
+        seams: delta(4),
         deepestMs: Math.round(Math.max(0, ...inside.map(([, ms]) => ms ?? 0))),
         underrunMs: Math.round((delta(3) * 1000) / sampleRate),
         gapsBehindVideo,
@@ -254,7 +346,7 @@ function ageOf(shown: readonly Shown[], scene: Scene, from: number, to: number):
 
 async function wsStep(res: Checks, host: Host): Promise<void> {
     const { port } = await host.start({ label: 'websockets', mode: 'websockets', env: ENV });
-    const tone = pulseSine();
+    const tone = timeCode();
     const scene = startScene();
     const painter = scene.child;
     const relay = spawn(suitesBin('bwrelay'), [String(RELAY_PORT), String(port), String(HIGH_KBIT)], { stdio: ['pipe', 'pipe', 'ignore'] });
@@ -336,14 +428,23 @@ async function wsStep(res: Checks, host: Host): Promise<void> {
             recovery: phase(arrivals, samples, back, back + RECOVERY_MS),
             after: phase(arrivals, samples, back + RECOVERY_MS, end),
         };
-        const row = { link: { highKbit: HIGH_KBIT, lowKbit: LOW_KBIT, lowS: LOW_S, backKbit: BACK_KBIT }, noise: NOISE ?? null, phases, age, light, resume };
+        const heardAll = asHeard(await within(page.evaluate('window.__heard'))).filter(([t]) => t >= t0);
+        const heard = {
+            before: heardPhase(heardAll, t0, down),
+            congested: heardPhase(heardAll, down, back),
+            recovery: heardPhase(heardAll, back, back + RECOVERY_MS),
+            after: heardPhase(heardAll, back + RECOVERY_MS, end),
+        };
+        const row = { link: { highKbit: HIGH_KBIT, lowKbit: LOW_KBIT, lowS: LOW_S, backKbit: BACK_KBIT }, noise: NOISE ?? null, phases, heard, age, light, resume };
         process.stdout.write(`${JSON.stringify(row)}\n`);
-        writeFileSync(join(WORKDIR, 'congestion-step-websockets.json'), JSON.stringify({ ...row, t0, down, back, end, arrivals, samples, shown: asShown(await within(page.evaluate('window.__shown'))), clock: scene.clock, link }, null, 0));
+        writeFileSync(join(WORKDIR, 'congestion-step-websockets.json'), JSON.stringify({ ...row, t0, down, back, end, arrivals, samples, heard: heardAll, shown: asShown(await within(page.evaluate('window.__shown'))), clock: scene.clock, link }, null, 0));
         const { before, congested, recovery } = phases;
         res.check('audio crosses the link at its rate before the step', before.audioPerS >= 0.8 * (1000 / FRAME_MS), before);
         res.check('audio keeps arriving while the link is narrow', congested.longestGapMs < 200, congested);
         res.check('the recovery delivers no audio backlog in a burst', recovery.densest100ms <= 2 * (100 / FRAME_MS), recovery);
-        res.check('the player sheds no backlog packet by packet after the recovery', recovery.dropped <= 2, recovery);
+        res.check('the player cuts what backlog the recovery delivers in no more than two seams', recovery.seams <= 2, recovery);
+        res.check('the sound heard after the recovery is no later than before the step',
+            heard.before.lateP50Ms !== null && heard.after.lateP50Ms !== null && heard.after.lateP50Ms <= heard.before.lateP50Ms + 100, heard);
         if (light) {
             res.check('a light screen shows no picture held behind the padding that sounds the returned link',
                 light.maxMs !== null && light.maxMs <= LIGHT_AGE_MS, light);
@@ -354,7 +455,7 @@ async function wsStep(res: Checks, host: Host): Promise<void> {
         if (browser) await closeBrowser(browser);
         relay.kill('SIGKILL');
         painter.kill('SIGKILL');
-        pulseUnload(tone);
+        tone.kill('SIGKILL');
     }
 }
 
