@@ -524,6 +524,11 @@ impl DisplayLink {
         }
         let current = self.video_bitrate_kbps(target_kbps);
         let steer = self.link_steer.get_or_insert_with(CongestionSteer::default);
+        let carried = matches!(self.sounding.phase, SoundPhase::Carried);
+        let landing = matches!(
+            self.sounding.phase,
+            SoundPhase::Read { .. } | SoundPhase::Drained { .. }
+        );
         let (rate, pad_bps, why) = match self.sounding.phase {
             SoundPhase::Idle => return None,
             SoundPhase::Hold(hold) => (current, hold.pad_bps, ""),
@@ -580,7 +585,12 @@ impl DisplayLink {
             }
             SoundPhase::Carried => {
                 self.sounding.phase = SoundPhase::Idle;
-                steer.land(target_kbps, target_kbps, now);
+                // A peak's ceiling rises with its frames: its steer is left free to follow a
+                // change's own delivery up to the next one, where a landing would hold the
+                // peak at this ceiling until a probe had climbed to that.
+                if !self.capped {
+                    steer.land(target_kbps, target_kbps, now);
+                }
                 (
                     target_kbps,
                     0.0,
@@ -588,9 +598,16 @@ impl DisplayLink {
                 )
             }
         };
+        if landing {
+            self.peak_settled = true;
+        }
         if matches!(self.sounding.phase, SoundPhase::Idle) {
             if let Some(probe) = self.link_probe.as_mut() {
-                probe.ended(now);
+                if carried {
+                    probe.carried(now);
+                } else {
+                    probe.ended(now);
+                }
             }
             self.sounding.armed_until = 0.0;
         }
@@ -600,7 +617,7 @@ impl DisplayLink {
         self.link_padding = pad_bps;
         self.link_kbps = Some(rate);
         let mut outcome = SteerOutcome {
-            cc_rate: self.link_hold.note(rate, now),
+            cc_rate: self.keep_rate(rate, now),
             applied_kbps: None,
             pad_bps: Some(pad_bps),
         };
