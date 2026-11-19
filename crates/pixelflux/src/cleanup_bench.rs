@@ -12,7 +12,8 @@
 //!
 //! `CODEC` (h264, h265, vp8, vp9, av1, jpeg), `CPU` (1 forces software),
 //! `FULLCOLOR` (1 for 4:4:4), `DEPTH` (bits per sample),
-//! `TURBO` (1), `CBR` (1), `KBPS`, `MIN_QP` (the constant-rate quantizer floor), `CRF`, `PAINT_CRF`, `PAINT` (use_paint_over_quality, 1),
+//! `TURBO` (1), `CBR` (1), `KBPS`, `CLIMB` (kbps the rate doubles a second up to from `KBPS`,
+//! moved every half second, as a capped CRF's peak climbs where no congestion has met it), `MIN_QP` (the constant-rate quantizer floor), `CRF`, `PAINT_CRF`, `PAINT` (use_paint_over_quality, 1),
 //! `KEYFRAME_S` (the scheduled key-frame interval), `W`, `H`, `FPS`, `MOTION` and `STILL` (frames), `STEP` (rows the scroll moves a frame, 4), `CARET`
 //! (frames per caret toggle, 0 none), `VIDEO` (`WxH`, a box at the bottom right repainted with a
 //! moving picture every frame for the whole run, the PSNR then measured outside it),
@@ -24,7 +25,8 @@
 //! then measured over the whole screen and the bytes from there reported apart),
 //! `RESUME` (frames of motion after the still phase), `TRIGGER` (paint-over trigger frames),
 //! `PRESTILL` (frames held still before the measured phase, which then opens with the screen
-//! moving `JUMP` rows at once: a window opening on a clean still screen), `IDR_AT` and `IDR_EVERY`
+//! moving `JUMP` rows at once, and again on each of the `JUMPS` frames from there, 1 unless set:
+//! a window opening on a clean still screen and painting over that many frames), `IDR_AT` and `IDR_EVERY`
 //! (a key frame asked for that many frames into the still phase, and every so many after, as a
 //! joining or recovering client does), `TARGET_DB` (the PSNR
 //! whose time to reach it is reported), `SSIM` (1 measures SSIM on every frame, not only from the
@@ -250,6 +252,8 @@ fn cleanup_bench() {
     let step: usize = env("STEP", 4);
     let prestill: usize = env("PRESTILL", 0);
     let jump: usize = env("JUMP", 0);
+    let jumps: usize = env("JUMPS", 1);
+    let climb: f64 = env("CLIMB", 0.0);
     let still: usize = env("STILL", 240);
     let resume: usize = env("RESUME", 0);
     let caret_period: usize = env("CARET", 0);
@@ -317,9 +321,9 @@ fn cleanup_bench() {
         } else if t < stop {
             motion * step
         } else if t < stop + still {
-            motion * step + jump
+            motion * step + jump * (t + 1 - stop).min(jumps)
         } else {
-            motion * step + jump + (t + 1 - stop - still) * step
+            motion * step + jump * jumps + (t + 1 - stop - still) * step
         };
         let caret = caret_period > 0 && t >= stop && ((t - stop) / caret_period).is_multiple_of(2);
         canvas.frame(&mut frame, h, scroll, caret);
@@ -327,6 +331,11 @@ fn cleanup_bench() {
         let video_plays = frozen.is_none_or(|f| t < f);
         if let Some(area) = video {
             paint_video(&mut frame, w, area, frozen.map_or(t, |f| t.min(f)));
+        }
+        if climb > 0.0 && (t as f64 * 2.0 / fps).fract() == 0.0 {
+            let kbps =
+                (f64::from(settings.video_bitrate_kbps) * 2f64.powf(t as f64 / fps)).min(climb);
+            p.update_rate(kbps as i32, settings.video_vbv_multiplier, 0.0);
         }
         let since = t as i64 - stop as i64 - idr_at;
         if idr_at > 0 && since >= 0 && (since == 0 || (idr_every > 0 && since % idr_every == 0)) {

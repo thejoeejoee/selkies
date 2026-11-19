@@ -589,11 +589,14 @@ pub struct H264EncoderWrapper {
     /// uncapped and the peak is held beside it. A key frame is aimed at half the bucket's room,
     /// as x264's VBV holds a frame to half its buffer's fill: from the start where the last key
     /// frame says it would not fit (`H264EncoderWrapper::aim_key`), else by one encode more where
-    /// its first comes out past the room (`H264EncoderWrapper::fit_key`). The quantizer ceiling it
-    /// opened with, which
-    /// the peak lowers to 51 while it binds.
+    /// its first comes out past the room (`H264EncoderWrapper::fit_key`).
     peak: Option<PeakOffset>,
+    /// The quantizer ceiling the session opened with, which a constant rate keeps.
     open_qp_max: i32,
+    /// The quantizer ceiling x264 holds now (`ceiling_at`), on its own scale.
+    qp_max: i32,
+    /// Whether the rate factor is the quantizer ceiling (`ceil_at_rate_factor`).
+    ceils: bool,
     /// The frame the last encode coded (`Coded`), and whether it was coded coarser than the
     /// rate factor for the peak (`coded_capped`).
     coded: Option<Coded>,
@@ -694,7 +697,8 @@ impl H264EncoderWrapper {
     ///      `vbv_kbit` and `bitrate_kbps` cap it at that peak with a buffer of that size, held
     ///      beside x264 (`PeakOffset`): the session opens as an uncapped one, and where the peak
     ///      binds the rate factor rises, up to 51, so content the cap starves overshoots it
-    ///      rather than freezes. A `vbv_kbit` or `bitrate_kbps` of 0 leaves it uncapped.
+    ///      rather than freezes. A `vbv_kbit` or `bitrate_kbps` of 0 leaves it uncapped. The
+    ///      rate factor is the session's quantizer ceiling while no peak binds (`ceiling_at`).
     /// 4. **Color**: I444 at full range or I420 at limited range, a VUI declaring that range
     ///    with the BT.709 primaries, transfer, and matrix the sRGB source and the conversion
     ///    carry, and the matching `high444` / `baseline` profile.
@@ -931,7 +935,7 @@ impl H264EncoderWrapper {
                 None
             } else {
                 codec_sys::x264::x264_encoder_parameters(encoder, &mut param);
-                Some(Self {
+                let mut session = Self {
                     encoder,
                     width,
                     height,
@@ -957,6 +961,8 @@ impl H264EncoderWrapper {
                         PeakOffset::new(bitrate_kbps.saturating_abs(), vbv_kbit, frame_rate.fps())
                     }),
                     open_qp_max: param.rc.i_qp_max,
+                    qp_max: param.rc.i_qp_max,
+                    ceils: true,
                     coded: None,
                     last_capped: false,
                     bound_once: false,
@@ -966,7 +972,11 @@ impl H264EncoderWrapper {
                     quant_offsets: Vec::new(),
                     mb_info: Vec::new(),
                     held_input: None,
-                })
+                };
+                if !cbr_mode {
+                    session.set_rate_factor(crf, 0.0);
+                }
+                Some(session)
             }
         }
     }
@@ -990,21 +1000,76 @@ impl H264EncoderWrapper {
         }
     }
 
-    /// Put the rate factor at `crf` plus a peak's `offset`, the quantizer ceiling at 51 while an
-    /// offset holds and at the session's own otherwise; true where x264 took it.
+    /// The quantizer ceiling, on x264's scale, of a session at rate factor `crf` plus a peak's
+    /// `offset`: the rate factor itself while no offset holds, and 51 while one does, where the
+    /// peak picks the quantizer. x264's rate factor is a quantizer only for content of the
+    /// complexity it is scaled to, and plans a frame coarser the more complex it reads it
+    /// (`qcomp`): a 1080p page changing whole at rate factor 25 was planned at 36 to 38, a
+    /// picture of 25 dB, and coded again over the eleven frames after it as the plan fell back
+    /// to 18. Under the ceiling a change arrives at the rate factor's quantizer, and x264 still
+    /// plans a frame that holds still finer than it. A constant rate keeps the ceiling it opened
+    /// with, as does a session told to (`ceil_at_rate_factor`).
+    fn ceiling_at(&self, crf: i32, offset: f64) -> i32 {
+        if self.is_cbr || (!self.ceils && offset <= 0.0) {
+            self.open_qp_max
+        } else if offset > 0.0 {
+            51 + qp_offset(self.bit_depth)
+        } else {
+            crf.clamp(0, 51) + qp_offset(self.bit_depth)
+        }
+    }
+
+    /// Put the rate factor at `crf` plus a peak's `offset` under its quantizer ceiling
+    /// (`ceiling_at`); true where x264 took it.
     fn set_rate_factor(&mut self, crf: i32, offset: f64) -> bool {
+        let qp_max = self.ceiling_at(crf, offset);
         unsafe {
             let mut param: codec_sys::x264::x264_param_t = std::mem::zeroed();
             codec_sys::x264::x264_encoder_parameters(self.encoder, &mut param);
             param.rc.f_rf_constant = (f64::from(crf) + offset) as f32;
-            param.rc.i_qp_max = if offset > 0.0 {
-                51 + qp_offset(self.bit_depth)
-            } else {
-                self.open_qp_max
-            };
+            param.rc.i_qp_max = qp_max;
             let taken = codec_sys::x264::x264_encoder_reconfig(self.encoder, &mut param) == 0;
             if taken {
                 self.rf_constant = f64::from(param.rc.f_rf_constant);
+                self.qp_max = qp_max;
+            }
+            taken
+        }
+    }
+
+    /// Hold the frames from the next under the rate factor as their quantizer ceiling
+    /// (`ceiling_at`), or leave them to x264's plan. The stripe path leaves it a frame over
+    /// blocks a binding peak coded coarse (`ledger::BlockLedger::coarse`): x264 codes again
+    /// whatever its reference holds coarser than the frame's quantizer, under the ceiling a
+    /// page of them in one frame (at 720p 599 kB into the 67 kB a 4 Mbit/s peak has room for),
+    /// where its plan over that residual stands high and leaves them to the refresh. It leaves
+    /// it a change its peak's bucket has no room for at the rate factor too (`holds_change`):
+    /// the frame that overflows a bucket goes out whole, and under the ceiling a page changing
+    /// whole is 1163 kB where x264's plan makes it 662, a second and more of a 12 Mbit/s path
+    /// against 0.6 s.
+    pub fn ceil_at_rate_factor(&mut self, on: bool) {
+        if self.is_cbr || on == self.ceils {
+            return;
+        }
+        self.ceils = on;
+        let offset = self.peak.map_or(0.0, |p| p.offset);
+        let qp_max = self.ceiling_at(self.current_crf, offset);
+        if qp_max != self.qp_max {
+            self.set_ceiling(qp_max);
+        }
+    }
+
+    /// Move the quantizer ceiling alone to `qp_max` on x264's scale; true where x264 took it.
+    /// A frame held coarser than the ceiling is coded with it lifted (`encode_picture`), x264
+    /// clipping a forced quantizer to the ceiling as it does its plan.
+    fn set_ceiling(&mut self, qp_max: i32) -> bool {
+        unsafe {
+            let mut param: codec_sys::x264::x264_param_t = std::mem::zeroed();
+            codec_sys::x264::x264_encoder_parameters(self.encoder, &mut param);
+            param.rc.i_qp_max = qp_max;
+            let taken = codec_sys::x264::x264_encoder_reconfig(self.encoder, &mut param) == 0;
+            if taken {
+                self.qp_max = qp_max;
             }
             taken
         }
@@ -1465,6 +1530,22 @@ impl H264EncoderWrapper {
         last.bits * 2f64.powf((from - f64::from(crf)) / KEY_STEPS) <= peak.room()
     }
 
+    /// Whether the bucket of a capped CRF's peak has room for a frame that changes `share` of the
+    /// picture coded at the rate factor (`encode_cpu_from`): for that share of what the last key
+    /// frame's first attempt (`LastKey`) would come to at it, a frame whose content is all new
+    /// costing about a key frame (1163 kB against 1253 for a 1080p page of text). The stripe
+    /// path asks for the whole picture where it does not know what this frame changes: a
+    /// content hash, and Turbo's above all, which reads the frame before's. True uncapped or
+    /// before a key frame.
+    pub fn holds_change(&self, share: f64) -> bool {
+        let (Some(peak), Some(last)) = (self.peak, self.last_key) else {
+            return true;
+        };
+        let from = if last.held { last.qp } else { last.rf };
+        let whole = last.bits * 2f64.powf((from - f64::from(self.current_crf)) / KEY_STEPS);
+        share * whole <= peak.room().max(0.0)
+    }
+
     /// The quantizer a capped CRF's key frame is held at from the start, where the last key
     /// frame's first attempt (`LastKey`) says one at the rate factor now would overflow the room
     /// the bucket has left: aimed at half that room, at `KEY_STEPS` quantizer steps a halving
@@ -1574,6 +1655,10 @@ impl H264EncoderWrapper {
             } as i32;
             let held = self.held_qp.take();
             let offset = qp_offset(self.bit_depth);
+            let ceiling = self.qp_max;
+            let lifted = !self.is_cbr
+                && held.is_some_and(|q| q + offset > ceiling)
+                && self.set_ceiling(51 + offset);
             pic_in.i_qpplus1 =
                 held.map_or(codec_sys::x264::X264_QP_AUTO as i32, |q| q + offset + 1);
             // x264 reads the offsets as the frame is submitted, within this call.
@@ -1597,6 +1682,9 @@ impl H264EncoderWrapper {
                 &mut pic_out,
             );
             self.quant_offsets.clear();
+            if lifted {
+                self.set_ceiling(ceiling);
+            }
 
             if frame_size > 0 {
                 // x264 says the quantizer it planned the frame at, while its row-level control
@@ -2825,7 +2913,15 @@ pub fn encode_cpu_from(
                         stripe_state.ledger.plan(trigger_frames, most, usize::MAX)
                     })
                     .flatten();
+                let coarse = stripe_state.ledger.coarse();
+                let changed = if current && !hash_damage {
+                    let still = stripe_state.ledger.unchanged().filter(|&still| still).count();
+                    1.0 - still as f64 / stripe_state.ledger.blocks().max(1) as f64
+                } else {
+                    1.0
+                };
                 if let Some(ref mut enc) = stripe_state.h264_encoder {
+                    enc.ceil_at_rate_factor(!coarse && enc.holds_change(changed));
                     if let Some(q) = hold.filter(|_| video_cbr) {
                         enc.hold_quantizer(q);
                     }
@@ -4846,6 +4942,87 @@ mod qp_bound_sweep {
             worst = worst.max(enc.last_qp().unwrap_or(0));
         }
         assert!(worst <= 51, "a starved capped CRF coded quantizer {worst}");
+    }
+
+    /// An uncapped CRF session codes a page that changes whole at its rate factor's quantizer
+    /// and no coarser, where x264's plan alone stands eleven steps over it (36 at rate factor
+    /// 25), and still plans the frames that hold still after it finer. Each page is 1000 rows
+    /// from the last, so nothing of one predicts the next. Needs the x264 the repository builds
+    /// (`patches/x264`), whose reconfigure moves the quantizer ceiling.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_crf_codes_a_change_of_the_whole_page_at_its_rate_factor() {
+        const CRF: i32 = 25;
+        let mut enc =
+            H264EncoderWrapper::new(W as i32, H as i32, CRF, false, 60.0, 4, false, 0, 0, 0, 0)
+                .expect("x264 init");
+        let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
+        let code = |enc: &mut H264EncoderWrapper, page: usize, id: u16| {
+            let mut out = Vec::new();
+            enc.encode_with_headers(
+                &text_luma(page),
+                &u,
+                &v,
+                W as i32,
+                (W / 2) as i32,
+                (W / 2) as i32,
+                id,
+                id == 0,
+                true,
+                &mut out,
+            );
+            (enc.last_qp().expect("a coded frame"), out.len())
+        };
+        for id in 0..30 {
+            code(&mut enc, 0, id);
+        }
+        for (id, page) in (30..33).zip([250, 500, 750]) {
+            let (qp, bytes) = code(&mut enc, page, id);
+            assert!(
+                i64::from(qp) <= i64::from(CRF),
+                "page {page} coded at quantizer {qp} in {bytes} bytes"
+            );
+        }
+        let still = (33..63).map(|id| code(&mut enc, 750, id).0).min();
+        assert!(
+            still.is_some_and(|qp| i64::from(qp) < i64::from(CRF)),
+            "a still page planned no finer than {still:?}"
+        );
+    }
+
+    /// A capped CRF session says whether its peak's bucket has room for a change at the rate
+    /// factor from its last key frame: a whole page under a 4 Mbit/s peak has none, a twentieth
+    /// of it has, and so has the whole page under a peak of a gigabit or none.
+    #[cfg(feature = "gpl")]
+    #[test]
+    fn x264_capped_crf_says_whether_its_bucket_holds_a_change() {
+        let key = |kbps: i32, vbv: i32| {
+            let mut enc = H264EncoderWrapper::new(
+                W as i32, H as i32, 25, false, 60.0, 4, false, kbps, vbv, 0, 0,
+            )
+            .expect("x264 init");
+            let (u, v) = (vec![128u8; W * H / 4], vec![128u8; W * H / 4]);
+            let mut out = Vec::new();
+            enc.encode_with_headers(
+                &text_luma(0),
+                &u,
+                &v,
+                W as i32,
+                (W / 2) as i32,
+                (W / 2) as i32,
+                0,
+                true,
+                true,
+                &mut out,
+            );
+            enc
+        };
+        let low = key(4000, 533);
+        assert!(!low.holds_change(1.0), "a page into 67 kB");
+        assert!(low.holds_change(0.0));
+        let high = key(1_000_000, 133_333);
+        assert!(high.holds_change(1.0), "a page under a gigabit");
+        assert!(key(0, 0).holds_change(1.0), "uncapped");
     }
 
     /// A constant-rate session on a still screen of text after a scroll says the quantizer its
